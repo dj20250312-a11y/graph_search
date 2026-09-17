@@ -473,10 +473,130 @@ def get_admissible_scale_factor(G, pos, default_scale=12.0):
     return default_scale
 
 
-def trace_astar(graph_weighted, start_station, end_station, pos, heuristic_type="euclidean", weight=1.0):
+def eval_custom_heuristic(code_str: str, pos: dict, target_station: str, stations: list):
+    """
+    학생이 작성한 파이썬 수식 또는 함수 코드를 실행하여 각 역의 h(n) 딕셔너리를 반환합니다.
+    오류 발생 시 (None, 에러메시지)를 반환합니다.
+    """
+    if not pos or target_station not in pos:
+        return {stn: 0.0 for stn in stations}, None
+
+    gx, gy = pos[target_station]
+    h_scores = {}
+    local_env = {
+        "math": math,
+        "abs": abs,
+        "min": min,
+        "max": max,
+        "round": round,
+        "sqrt": math.sqrt
+    }
+
+    try:
+        if "def " in code_str:
+            exec(code_str, local_env, local_env)
+            custom_func = None
+            for k, v in local_env.items():
+                if callable(v) and k not in ("math", "abs", "min", "max", "round", "sqrt"):
+                    custom_func = v
+                    break
+            if not custom_func:
+                return None, "코드에서 정의된 휴리스틱 함수(def ...)를 찾을 수 없습니다."
+
+            import inspect
+            sig = inspect.signature(custom_func)
+            param_count = len(sig.parameters)
+
+            for stn in stations:
+                if stn == target_station:
+                    h_scores[stn] = 0.0
+                    continue
+                x, y = pos.get(stn, (0.0, 0.0))
+                dx = abs(x - gx)
+                dy = abs(y - gy)
+                dist = math.sqrt(dx ** 2 + dy ** 2)
+
+                if param_count == 1:
+                    val = custom_func(dist)
+                elif param_count == 2:
+                    val = custom_func(dx, dy)
+                elif param_count == 3:
+                    val = custom_func(dx, dy, dist)
+                elif param_count >= 7:
+                    val = custom_func(dx, dy, dist, x, y, gx, gy)
+                else:
+                    val = custom_func(dist)
+                h_scores[stn] = max(0.0, round(float(val), 1))
+        else:
+            for stn in stations:
+                if stn == target_station:
+                    h_scores[stn] = 0.0
+                    continue
+                x, y = pos.get(stn, (0.0, 0.0))
+                dx = abs(x - gx)
+                dy = abs(y - gy)
+                dist = math.sqrt(dx ** 2 + dy ** 2)
+                eval_ctx = {
+                    **local_env,
+                    "dx": dx, "dy": dy, "dist": dist,
+                    "x": x, "y": y, "gx": gx, "gy": gy,
+                    "station": stn, "goal": target_station
+                }
+                val = eval(code_str.strip(), eval_ctx)
+                h_scores[stn] = max(0.0, round(float(val), 1))
+        return h_scores, None
+    except Exception as e:
+        return None, f"수식 계산 중 오류가 발생했습니다: {e}"
+
+
+def check_admissibility(graph_weighted, target_station, h_scores):
+    """
+    목표 역까지의 실제 최단 시간 h*(n)을 다익스트라로 계산하여,
+    학생의 h(n)이 Admissible (h(n) <= h*(n))한지 검증합니다.
+    """
+    true_shortest = {}
+    for stn in graph_weighted:
+        if stn == target_station:
+            true_shortest[stn] = 0
+        else:
+            _, _, t = trace_dijkstra(graph_weighted, stn, target_station)
+            true_shortest[stn] = t if t is not None else 999999
+
+    records = []
+    violations = []
+    for stn in graph_weighted:
+        h_val = h_scores.get(stn, 0.0)
+        true_val = true_shortest.get(stn, 0)
+        is_ok = (h_val <= true_val)
+        diff = round(h_val - true_val, 1)
+
+        if not is_ok:
+            violations.append({
+                "station": stn,
+                "h_val": h_val,
+                "true_val": true_val,
+                "overestimate": diff
+            })
+
+        status_str = "✅ 적합 (h ≤ h*)" if is_ok else f"⚠️ 초과 (+{diff}분)"
+        records.append({
+            "지하철역": stn,
+            "학생 휴리스틱 h(n)": f"{h_val}분",
+            "실제 최단시간 h*(n)": f"{true_val}분",
+            "오차 (h - h*)": f"{'+' if diff > 0 else ''}{diff}분",
+            "적합성 여부": status_str
+        })
+
+    is_admissible = (len(violations) == 0)
+    df = pd.DataFrame(records)
+    return is_admissible, violations, df, true_shortest
+
+
+def trace_astar(graph_weighted, start_station, end_station, pos, heuristic_type="euclidean", weight=1.0, custom_h_dict=None):
     """
     A* 최단 경로 알고리즘의 각 단계(f = g + w*h 계산, 열린 목록(Open Set), 닫힌 목록(Closed Set),
     선택 사유, 역추적 등)를 기록합니다.
+    - custom_h_dict: 학생이 직접 입력한 {역: h값} 딕셔너리가 제공되면 해당 값을 우선 적용합니다.
     """
     G = nx.Graph()
     for u, neighbors in graph_weighted.items():
@@ -487,8 +607,12 @@ def trace_astar(graph_weighted, start_station, end_station, pos, heuristic_type=
                 v, w = item, 10
             G.add_edge(u, v, weight=w)
 
-    scale_factor = get_admissible_scale_factor(G, pos)
-    h_scores = compute_heuristic(pos, end_station, heuristic_type, scale_factor)
+    if custom_h_dict is not None:
+        h_scores = {stn: max(0.0, round(float(custom_h_dict.get(stn, 0.0)), 1)) for stn in graph_weighted}
+        scale_factor = 1.0
+    else:
+        scale_factor = get_admissible_scale_factor(G, pos)
+        h_scores = compute_heuristic(pos, end_station, heuristic_type, scale_factor)
 
     g_scores = {station: 999999 for station in graph_weighted}
     g_scores[start_station] = 0
@@ -1107,12 +1231,13 @@ subway_weighted_map = {
     current_pos = compute_graph_layout(G_base, selected_layout_mode)
 
     # --------------------------------------------------------------------------
-    # 7대 탭 메뉴 구성
+    # 8대 탭 메뉴 구성
     # --------------------------------------------------------------------------
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "🔍 [실습 1] DFS vs BFS 단계별 탐색",
         "⚡ [실습 2] 다익스트라 최단 경로",
         "⭐ [실습 3] A* 휴리스틱 최단 경로",
+        "🧪 [실습 4] 나만의 휴리스틱 설계 & 실험실",
         "⚖️ [비교 1] DFS vs BFS 동시 비교",
         "🚀 [비교 2] 다익스트라 vs A* 효율 비교",
         "🚧 [시나리오] 공사·지연 우회 시뮬레이터",
@@ -1478,9 +1603,261 @@ subway_weighted_map = {
             """)
 
     # ==========================================================================
-    # TAB 4: DFS vs BFS 동시 비교
+    # TAB 4: 나만의 휴리스틱 설계 & 실험실 (학생 참여형 커스텀 A* & 3자 배틀)
     # ==========================================================================
     with tab4:
+        st.subheader("🧪 나만의 휴리스틱 설계 & 성능 비교 실험실")
+        st.caption("학생들이 직접 수학 공식이나 표를 통해 휴리스틱 h(n)을 정의하고, 최적성(Admissibility) 진단 및 다익스트라/표준 A*와의 실시간 성능 대결을 펼쳐보세요!")
+
+        col_l1, col_l2, col_l3 = st.columns([3, 3, 4])
+        with col_l1:
+            lab_start = st.selectbox("출발역 선택", stations, index=0, key="lab_start")
+        with col_l2:
+            default_lab_end = 5 if len(stations) > 5 else len(stations) - 1
+            lab_end = st.selectbox("도착역 선택", stations, index=default_lab_end, key="lab_end")
+        with col_l3:
+            lab_weight = st.slider(
+                "⚖️ 휴리스틱 가중치 (w)",
+                min_value=0.0,
+                max_value=3.0,
+                value=1.0,
+                step=0.1,
+                help="w=1.0: 표준 가중치 | w=0: 다익스트라와 동일 | w>1: 탐욕성 강화",
+                key="lab_weight"
+            )
+
+        # 입력 방식 선택 (수식 코딩 vs 표 직접 입력)
+        lab_input_mode = st.radio(
+            "📝 휴리스틱 정의 방식 선택",
+            [
+                "💻 [모드 A] 파이썬 수식 코딩 (거리 함수 직접 설계)",
+                "📊 [모드 B] 역별 예상 소요 시간 직접 입력 (수업 활동지 표)"
+            ],
+            horizontal=True,
+            key="lab_input_mode"
+        )
+
+        custom_h_scores = {}
+        eval_err = None
+
+        if "모드 A" in lab_input_mode:
+            st.markdown("##### 💻 파이썬 수식 작성")
+            st.caption("사용 가능한 변수: `dist` (직선 유클리드 거리), `dx` (|x - gx|), `dy` (|y - gy|), `math.sqrt()`, `max()`, `min()`")
+
+            preset_col1, preset_col2 = st.columns([4, 6])
+            with preset_col1:
+                preset_choice = st.selectbox(
+                    "📋 예제 프리셋 불러오기",
+                    [
+                        "🎯 표준 유클리드 직선거리 (dist * 12.0) [최적 보장]",
+                        "📐 맨해튼 격자거리 ((dx + dy) * 10.0) [최적 보장]",
+                        "♟️ 체비쇼프 대각선 거리 (max(dx, dy) * 12.0) [최적 보장]",
+                        "⚠️ 과대평가 휴리스틱 (dist * 35.0) [최단 경로 실패 체험!]",
+                        "0️⃣ 다익스트라 제로 모드 (0.0) [완전 탐색]",
+                        "✏️ 직접 자유 작성"
+                    ],
+                    key="lab_preset_choice"
+                )
+
+            preset_code_map = {
+                "🎯 표준 유클리드 직선거리 (dist * 12.0) [최적 보장]": "dist * 12.0",
+                "📐 맨해튼 격자거리 ((dx + dy) * 10.0) [최적 보장]": "(dx + dy) * 10.0",
+                "♟️ 체비쇼프 대각선 거리 (max(dx, dy) * 12.0) [최적 보장]": "max(dx, dy) * 12.0",
+                "⚠️ 과대평가 휴리스틱 (dist * 35.0) [최단 경로 실패 체험!]": "dist * 35.0",
+                "0️⃣ 다익스트라 제로 모드 (0.0) [완전 탐색]": "0.0",
+                "✏️ 직접 자유 작성": "dist * 12.0"
+            }
+
+            default_code = preset_code_map.get(preset_choice, "dist * 12.0")
+            code_input_val = st.text_area(
+                "휴리스틱 공식 (단일 수식 또는 def 함수)",
+                value=default_code,
+                height=90,
+                key=f"lab_code_text_{preset_choice}",
+                help="예: dist * 12.0  또는  (dx + dy) * 10.0"
+            )
+
+            custom_h_scores, eval_err = eval_custom_heuristic(code_input_val, current_pos, lab_end, stations)
+            if eval_err:
+                st.error(f"❌ {eval_err}")
+                custom_h_scores = {stn: 0.0 for stn in stations}
+
+        else:
+            # 모드 B: 데이터 에디터 표 입력
+            st.markdown("##### 📊 수업 활동지: 역별 예상 소요 시간 직접 입력")
+            st.caption(f"출발역 '{lab_start}'에서 도착역 '{lab_end}'까지 각 역을 거칠 때 남아있을 것으로 예상되는 시간(분)을 숫자로 입력해보세요.")
+
+            # 기본값으로 유클리드 거리 기반 어림값 자동 채움
+            def_h, _ = eval_custom_heuristic("dist * 12.0", current_pos, lab_end, stations)
+            def_records = []
+            for stn in stations:
+                def_records.append({
+                    "지하철역": stn,
+                    "목표역까지 예상 잔여 시간(분)": float(def_h.get(stn, 0.0) if stn != lab_end else 0.0)
+                })
+            
+            edited_df = st.data_editor(
+                pd.DataFrame(def_records),
+                use_container_width=True,
+                key="lab_table_editor",
+                column_config={
+                    "지하철역": st.column_config.TextColumn(disabled=True),
+                    "목표역까지 예상 잔여 시간(분)": st.column_config.NumberColumn(min_value=0.0, max_value=120.0, step=0.5)
+                }
+            )
+            custom_h_scores = {}
+            for _, row in edited_df.iterrows():
+                custom_h_scores[row["지하철역"]] = float(row["목표역까지 예상 잔여 시간(분)"])
+            custom_h_scores[lab_end] = 0.0
+
+        st.divider()
+
+        # ----------------------------------------------------------------------
+        # 1. Admissibility(휴리스틱 적합성) 자동 진단기
+        # ----------------------------------------------------------------------
+        st.markdown("### 🩺 1단계: 휴리스틱 적합성(Admissibility) 자동 진단")
+        is_admissible, violations, diag_df, true_shortest = check_admissibility(weighted_map, lab_end, custom_h_scores)
+
+        if is_admissible:
+            st.success(f"🎉 **최적성 보장 (Admissible 충족)!** 학생이 정의한 휴리스틱 $h(n)$이 모든 역에서 실제 최단 소요 시간 $h^*(n)$ 이하입니다. **A*가 100% 최적의 최단 경로를 보장합니다.**")
+        else:
+            over_stns = [v["station"] for v in violations]
+            st.warning(f"⚠️ **과대평가 경고 (Inadmissible 감지)!** 다음 역의 휴리스틱 추정치가 실제 최단 시간보다 큽니다: **{', '.join(over_stns)}**. $h(n) > h^*(n)$ 일 경우 A*가 최적 최단 경로를 놓칠 수 있습니다!")
+
+        with st.expander("📊 역별 휴리스틱 $h(n)$ vs 실제 최단 시간 $h^*(n)$ 정밀 비교표 보기", expanded=False):
+            st.dataframe(diag_df, hide_index=True, use_container_width=True)
+
+        st.divider()
+
+        # ----------------------------------------------------------------------
+        # 2. 실시간 3자 성능 대결 (배틀 모드)
+        # ----------------------------------------------------------------------
+        st.markdown("### ⚔️ 2단계: 실시간 3자 성능 대결 (배틀 모드)")
+        st.caption(f"구간: **{lab_start} ➔ {lab_end}** 에서 3개 알고리즘이 각각 몇 개의 역을 방문하고 최단 경로를 찾는지 대결합니다.")
+
+        # 1) 학생 커스텀 A*
+        c_steps, c_path, c_time, _ = trace_astar(
+            weighted_map, lab_start, lab_end, current_pos, weight=lab_weight, custom_h_dict=custom_h_scores
+        )
+        c_visited = c_steps[-1]["closed_set"]
+        c_count = len(c_visited)
+
+        # 2) 표준 유클리드 A*
+        std_steps, std_path, std_time, _ = trace_astar(
+            weighted_map, lab_start, lab_end, current_pos, "euclidean", 1.0
+        )
+        std_visited = std_steps[-1]["closed_set"]
+        std_count = len(std_visited)
+
+        # 3) 다익스트라
+        d_steps, d_path, d_time = trace_dijkstra(weighted_map, lab_start, lab_end)
+        d_visited = d_steps[-1]["visited"]
+        d_count = len(d_visited)
+
+        # 대결 요약 메트릭
+        m_b1, m_b2, m_b3, m_b4 = st.columns(4)
+        with m_b1:
+            st.metric("🎓 학생 커스텀 A*", f"{c_count}개 역 방문", f"{c_time}분 소요" if c_time else "도달불가")
+        with m_b2:
+            st.metric("⭐ 표준 유클리드 A*", f"{std_count}개 역 방문", f"{std_time}분 소요")
+        with m_b3:
+            st.metric("⚡ 다익스트라 (전방위)", f"{d_count}개 역 방문", f"{d_time}분 소요")
+        with m_b4:
+            is_optimal = (c_time == d_time)
+            st.metric(
+                "🎯 최적 경로 일치 여부",
+                "✅ 100% 최적 성공!" if is_optimal else "❌ 최적 실패 (우회)",
+                delta=f"소요시간 차이: {c_time - d_time}분" if not is_optimal else "최적해 일치"
+            )
+
+        # 3자 나란히 네트워크 비교
+        col_g1, col_g2, col_g3 = st.columns(3)
+
+        with col_g1:
+            st.markdown("#### 🎓 학생 커스텀 A*")
+            st.caption(f"방문 역 ({c_count}개): {' ➔ '.join(c_visited)}")
+            st.write(f"경로: **{' ➔ '.join(c_path)}** ({c_time}분)")
+            c_edges = [(c_path[i], c_path[i+1]) for i in range(len(c_path)-1)] if c_path else []
+            fig_c = create_graph_figure(
+                graph=graph,
+                weighted_map=weighted_map,
+                highlight_nodes=c_visited,
+                highlight_edges=c_edges,
+                start_node=lab_start,
+                end_node=lab_end,
+                title="학생 커스텀 A* 탐색 경로",
+                layout_mode=selected_layout_mode
+            )
+            st.plotly_chart(fig_c, use_container_width=True, key="lab_fig_custom")
+
+        with col_g2:
+            st.markdown("#### ⭐ 표준 유클리드 A*")
+            st.caption(f"방문 역 ({std_count}개): {' ➔ '.join(std_visited)}")
+            st.write(f"경로: **{' ➔ '.join(std_path)}** ({std_time}분)")
+            std_edges = [(std_path[i], std_path[i+1]) for i in range(len(std_path)-1)] if std_path else []
+            fig_std = create_graph_figure(
+                graph=graph,
+                weighted_map=weighted_map,
+                highlight_nodes=std_visited,
+                highlight_edges=std_edges,
+                start_node=lab_start,
+                end_node=lab_end,
+                title="표준 유클리드 A* 탐색 경로",
+                layout_mode=selected_layout_mode
+            )
+            st.plotly_chart(fig_std, use_container_width=True, key="lab_fig_std")
+
+        with col_g3:
+            st.markdown("#### ⚡ 다익스트라")
+            st.caption(f"방문 역 ({d_count}개): {' ➔ '.join(d_visited)}")
+            st.write(f"경로: **{' ➔ '.join(d_path)}** ({d_time}분)")
+            d_edges = [(d_path[i], d_path[i+1]) for i in range(len(d_path)-1)] if d_path else []
+            fig_d = create_graph_figure(
+                graph=graph,
+                weighted_map=weighted_map,
+                highlight_nodes=d_visited,
+                highlight_edges=d_edges,
+                start_node=lab_start,
+                end_node=lab_end,
+                title="다익스트라 탐색 경로",
+                layout_mode=selected_layout_mode
+            )
+            st.plotly_chart(fig_d, use_container_width=True, key="lab_fig_dijk")
+
+        # 3자 대결 최종 결과 표
+        st.markdown("#### 🏆 3자 성능 대결 결과 종합")
+        battle_df = pd.DataFrame([
+            {
+                "알고리즘": "🎓 학생 커스텀 A*",
+                "방문한 역 수": f"{c_count}개 역",
+                "탐색 절감율 (vs 다익스트라)": f"{round((1 - c_count / max(1, d_count)) * 100, 1)}%",
+                "최단 소요 시간": f"{c_time}분",
+                "최적 경로 여부": "✅ 최단 보장" if is_optimal else "❌ 최단 실패 (차이: +{}분)".format(c_time - d_time),
+                "도출된 최단 경로": " ➔ ".join(c_path)
+            },
+            {
+                "알고리즘": "⭐ 표준 유클리드 A*",
+                "방문한 역 수": f"{std_count}개 역",
+                "탐색 절감율 (vs 다익스트라)": f"{round((1 - std_count / max(1, d_count)) * 100, 1)}%",
+                "최단 소요 시간": f"{std_time}분",
+                "최적 경로 여부": "✅ 최단 보장 (수학적 증명)",
+                "도출된 최단 경로": " ➔ ".join(std_path)
+            },
+            {
+                "알고리즘": "⚡ 다익스트라",
+                "방문한 역 수": f"{d_count}개 역",
+                "탐색 절감율 (vs 다익스트라)": "0.0% (기준)",
+                "최단 소요 시간": f"{d_time}분",
+                "최적 경로 여부": "✅ 기준 최단 경로",
+                "도출된 최단 경로": " ➔ ".join(d_path)
+            }
+        ])
+        st.dataframe(battle_df, hide_index=True, use_container_width=True, key="lab_battle_df")
+
+    # ==========================================================================
+    # TAB 5: DFS vs BFS 동시 비교
+    # ==========================================================================
+    with tab5:
         st.subheader("⚖️ DFS(깊이 우선) vs BFS(너비 우선) 나란히 비교")
         st.caption("동일한 출발역에서 두 알고리즘이 지하철망을 어떤 순서로 탐색하는지 직접 대조해보세요.")
 
@@ -1539,9 +1916,9 @@ subway_weighted_map = {
             """)
 
     # ==========================================================================
-    # TAB 5: 다익스트라 vs A* 효율 비교 (나란히 대조)
+    # TAB 6: 다익스트라 vs A* 효율 비교 (나란히 대조)
     # ==========================================================================
-    with tab5:
+    with tab6:
         st.subheader("🚀 다익스트라(전방위 탐색) vs A*(목표 지향형 탐색) 효율 비교")
         st.caption("동일한 출발역과 도착역에서 다익스트라와 A*의 탐색 범위, 방문 역 수, 방향성을 나란히 비교해보세요.")
 
@@ -1663,9 +2040,9 @@ subway_weighted_map = {
         st.dataframe(cmp_df, hide_index=True, use_container_width=True, key="t5_summary_df")
 
     # ==========================================================================
-    # TAB 6: 공사/지연 시뮬레이터 (What-if 분석)
+    # TAB 7: 공사/지연 시뮬레이터 (What-if 분석)
     # ==========================================================================
-    with tab6:
+    with tab7:
         st.subheader("🚧 실시간 지하철 공사 및 지연 우회 시나리오")
         st.caption("수업 활동지 과제: '동대문역 공사로 시간이 대폭 늘어나면 최단 경로는 어떻게 바뀔까?'")
 
@@ -1725,9 +2102,9 @@ subway_weighted_map = {
             st.plotly_chart(fig_sc, use_container_width=True, key="t6_scenario_chart")
 
     # ==========================================================================
-    # TAB 7: 코드 및 개념 학습장
+    # TAB 8: 코드 및 개념 학습장
     # ==========================================================================
-    with tab7:
+    with tab8:
         st.subheader("📖 그래프 탐색 4대 알고리즘 핵심 원리 & search.py 코드")
         
         col_cd1, col_cd2 = st.columns(2)
