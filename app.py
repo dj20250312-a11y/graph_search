@@ -4,6 +4,7 @@ import plotly.graph_objects as go
 import pandas as pd
 import copy
 import time
+import math
 
 # 페이지 설정
 st.set_page_config(
@@ -52,6 +53,7 @@ st.markdown("""
     .badge-dfs { background-color: #FEF3C7; color: #92400E; }
     .badge-bfs { background-color: #DBEAFE; color: #1E40AF; }
     .badge-dijkstra { background-color: #D1FAE5; color: #065F46; }
+    .badge-astar { background-color: #EDE9FE; color: #5B21B6; }
     
     .ds-box {
         font-family: 'Consolas', monospace;
@@ -426,6 +428,211 @@ def trace_dijkstra(graph_weighted, start_station, end_station):
     return steps, final_path, total_time
 
 
+def compute_heuristic(pos, target, heuristic_type="euclidean", scale_factor=12.0):
+    """
+    각 역에서 target 역까지의 휴리스틱 추정치 h(n)을 계산합니다.
+    - pos: 각 노드의 (x, y) 좌표 딕셔너리
+    - target: 목표 도착역
+    - heuristic_type: "euclidean" (직선거리), "manhattan" (격자거리), "zero" (다익스트라 모드)
+    """
+    h_scores = {}
+    if not pos or target not in pos:
+        return {node: 0.0 for node in pos}
+
+    xt, yt = pos[target]
+    for node, (x, y) in pos.items():
+        if node == target or heuristic_type == "zero":
+            h_scores[node] = 0.0
+        elif heuristic_type == "manhattan":
+            dist = abs(x - xt) + abs(y - yt)
+            h_scores[node] = round(dist * scale_factor, 1)
+        else:  # euclidean
+            dist = math.sqrt((x - xt) ** 2 + (y - yt) ** 2)
+            h_scores[node] = round(dist * scale_factor, 1)
+    return h_scores
+
+
+def get_admissible_scale_factor(G, pos, default_scale=12.0):
+    """
+    네트워크 간선 길이 대비 가중치를 분석하여
+    휴리스틱이 실제 최단 시간을 초과하지 않도록 보장(Admissible)하는 안전 축척 계수를 계산합니다.
+    """
+    min_ratio = float('inf')
+    for u, v, d in G.edges(data=True):
+        if u in pos and v in pos:
+            x0, y0 = pos[u]
+            x1, y1 = pos[v]
+            dist = math.sqrt((x0 - x1) ** 2 + (y0 - y1) ** 2)
+            weight = d.get('weight', 10)
+            if dist > 0.01:
+                ratio = weight / dist
+                if ratio < min_ratio:
+                    min_ratio = ratio
+    if min_ratio < float('inf'):
+        return round(min_ratio * 0.85, 1)
+    return default_scale
+
+
+def trace_astar(graph_weighted, start_station, end_station, pos, heuristic_type="euclidean", weight=1.0):
+    """
+    A* 최단 경로 알고리즘의 각 단계(f = g + w*h 계산, 열린 목록(Open Set), 닫힌 목록(Closed Set),
+    선택 사유, 역추적 등)를 기록합니다.
+    """
+    G = nx.Graph()
+    for u, neighbors in graph_weighted.items():
+        for item in neighbors:
+            if isinstance(item, (tuple, list)):
+                v, w = item[0], item[1]
+            else:
+                v, w = item, 10
+            G.add_edge(u, v, weight=w)
+
+    scale_factor = get_admissible_scale_factor(G, pos)
+    h_scores = compute_heuristic(pos, end_station, heuristic_type, scale_factor)
+
+    g_scores = {station: 999999 for station in graph_weighted}
+    g_scores[start_station] = 0
+
+    f_scores = {station: 999999 for station in graph_weighted}
+    f_scores[start_station] = round(weight * h_scores.get(start_station, 0.0), 1)
+
+    previous = {station: None for station in graph_weighted}
+    open_set = [start_station]
+    closed_set = []
+    tree_edges = []
+    steps = []
+
+    steps.append({
+        "step_num": 0,
+        "current": None,
+        "action": f"초기화: 출발역 '{start_station}' 등록 [g=0분, h={h_scores.get(start_station, 0.0)}분, f={f_scores[start_station]}분] ➔ 열린 목록(Open Set)에 추가",
+        "g_scores": copy.deepcopy(g_scores),
+        "h_scores": copy.deepcopy(h_scores),
+        "f_scores": copy.deepcopy(f_scores),
+        "previous": copy.deepcopy(previous),
+        "open_set": list(open_set),
+        "closed_set": list(closed_set),
+        "highlight_edges": [],
+        "updated_stations": [start_station],
+        "chosen_station": None
+    })
+
+    round_idx = 1
+    while open_set:
+        # 열린 목록 중 f_score가 가장 작은 역 선택 (f가 동일하면 h가 작은 역 우선)
+        current = min(open_set, key=lambda stn: (f_scores[stn], h_scores.get(stn, 0.0)))
+        cur_f = f_scores[current]
+        cur_g = g_scores[current]
+        cur_h = h_scores.get(current, 0.0)
+
+        if current == end_station:
+            open_set.remove(current)
+            closed_set.append(current)
+            if previous[current] is not None:
+                tree_edges.append((previous[current], current))
+
+            action_desc = f"[{round_idx}단계] 🎯 목적지 '{end_station}' 선택 완료! f(n)={cur_f}분 (g={cur_g} + h=0)으로 최소 비용 최단 경로 확정"
+            steps.append({
+                "step_num": len(steps),
+                "current": current,
+                "action": action_desc,
+                "g_scores": copy.deepcopy(g_scores),
+                "h_scores": copy.deepcopy(h_scores),
+                "f_scores": copy.deepcopy(f_scores),
+                "previous": copy.deepcopy(previous),
+                "open_set": list(open_set),
+                "closed_set": list(closed_set),
+                "highlight_edges": list(tree_edges),
+                "updated_stations": [],
+                "chosen_station": current
+            })
+            break
+
+        open_set.remove(current)
+        closed_set.append(current)
+        if previous[current] is not None:
+            tree_edges.append((previous[current], current))
+
+        updated_in_step = []
+        updates_desc = []
+
+        for next_station, travel_time in graph_weighted.get(current, []):
+            if next_station in closed_set:
+                continue
+
+            tentative_g = cur_g + travel_time
+
+            if tentative_g < g_scores[next_station]:
+                old_g = g_scores[next_station]
+                g_scores[next_station] = tentative_g
+                h_val = h_scores.get(next_station, 0.0)
+                new_f = round(tentative_g + weight * h_val, 1)
+                f_scores[next_station] = new_f
+                previous[next_station] = current
+                updated_in_step.append(next_station)
+
+                if next_station not in open_set:
+                    open_set.append(next_station)
+                    updates_desc.append(f"{next_station} 신규발견(g:{tentative_g}, h:{h_val} ➔ f:{new_f})")
+                else:
+                    updates_desc.append(f"{next_station} 단축(g:{old_g}➔{tentative_g}, f➔{new_f})")
+
+        action_desc = f"[{round_idx}단계] 열린 목록 중 f(n)이 최소인 '{current}'(f={cur_f} = g:{cur_g} + h:{cur_h}) 확정 및 이웃 탐색"
+        if updates_desc:
+            action_desc += f" ➔ {', '.join(updates_desc)}"
+        else:
+            action_desc += " ➔ 더 빠른 갱신 경로 없음"
+
+        steps.append({
+            "step_num": len(steps),
+            "current": current,
+            "action": action_desc,
+            "g_scores": copy.deepcopy(g_scores),
+            "h_scores": copy.deepcopy(h_scores),
+            "f_scores": copy.deepcopy(f_scores),
+            "previous": copy.deepcopy(previous),
+            "open_set": list(open_set),
+            "closed_set": list(closed_set),
+            "highlight_edges": list(tree_edges),
+            "updated_stations": updated_in_step,
+            "chosen_station": current
+        })
+        round_idx += 1
+
+    # 경로 역추적
+    path = []
+    curr = end_station
+    while curr is not None:
+        path.append(curr)
+        if curr == start_station:
+            break
+        curr = previous[curr]
+
+    final_path = list(reversed(path)) if path and path[-1] == start_station else []
+    total_time = g_scores[end_station] if final_path else None
+
+    # 최종 결과 단계
+    final_edges = [(final_path[i], final_path[i+1]) for i in range(len(final_path)-1)] if final_path else list(tree_edges)
+    steps.append({
+        "step_num": len(steps),
+        "current": end_station,
+        "action": f"🎉 탐색 완료! 목적지 '{end_station}' 도달 (최소 소요 시간: {total_time}분, 최단 경로: {' ➔ '.join(final_path)}, 총 방문 역: {len(closed_set)}개)",
+        "g_scores": copy.deepcopy(g_scores),
+        "h_scores": copy.deepcopy(h_scores),
+        "f_scores": copy.deepcopy(f_scores),
+        "previous": copy.deepcopy(previous),
+        "open_set": list(open_set),
+        "closed_set": list(closed_set),
+        "highlight_edges": final_edges,
+        "updated_stations": [],
+        "chosen_station": end_station,
+        "final_path": final_path,
+        "total_time": total_time
+    })
+
+    return steps, final_path, total_time, scale_factor
+
+
 # ------------------------------------------------------------------------------
 # 6. Plotly 고해상도 깔끔 그래프 렌더러
 # ------------------------------------------------------------------------------
@@ -439,7 +646,8 @@ def create_graph_figure(
     start_node=None,
     end_node=None,
     title="지하철 노선망 그래프",
-    layout_mode="kamada_kawai"
+    layout_mode="kamada_kawai",
+    node_labels_override=None
 ):
     """Plotly를 이용해 겹침 없이 깔끔한 네트워크 시각화 생성"""
     G = nx.Graph()
@@ -540,8 +748,10 @@ def create_graph_figure(
     for node in G.nodes():
         x, y = pos[node]
         node_x.append(x)
-        node_y.append(y)
-        node_text.append(f"<b>{node}</b>")
+        lbl = f"<b>{node}</b>"
+        if node_labels_override and node in node_labels_override:
+            lbl += f"<br><span style='font-size:10px;color:#475569;'>{node_labels_override[node]}</span>"
+        node_text.append(lbl)
 
         if node == current_node:
             node_colors.append('#F59E0B')      # 현재 방문 노드: 밝은 주황
@@ -711,12 +921,99 @@ def render_dijkstra_step(step, total_steps, d_start, d_end, d_final_path, d_tota
             st.info(f"💡 **역추적 원리:** 도착역 `{d_end}`에서부터 `previous` 딕셔너리를 거슬러 올라가 출발역 `{d_start}`까지 도달한 뒤 뒤집어(`reversed`) 경로를 구합니다.")
 
 
+def render_astar_step(step, total_steps, a_start, a_end, a_final_path, a_total_time, graph, weighted_map, stations, layout_mode, weight, heuristic_type, chart_key="t3_chart", df_key="t3_df"):
+    """A* 알고리즘의 단일 스텝에 대한 상태 배지, Plotly 그래프, f=g+h 평가 분석표를 렌더링"""
+    step_idx = step["step_num"]
+    is_last = (step_idx == total_steps - 1)
+
+    heur_name = "유클리드 직선거리" if heuristic_type == "euclidean" else ("맨해튼 격자거리" if heuristic_type == "manhattan" else "0 (다익스트라 모드)")
+    st.markdown(
+        f'<span class="algo-badge badge-astar">⭐ A* 알고리즘</span> <b>단계 {step_idx} / {total_steps-1}</b> [휴리스틱: {heur_name}, 가중치 w={weight}]: '
+        f'{step["action"]}',
+        unsafe_allow_html=True
+    )
+
+    col_ag, col_at = st.columns([7, 5])
+
+    with col_ag:
+        hl_path = a_final_path if is_last else step.get("closed_set", [])
+        hl_edges = [(a_final_path[i], a_final_path[i+1]) for i in range(len(a_final_path)-1)] if is_last and a_final_path else step.get("highlight_edges", [])
+
+        # 노드 위에 f(n) 표시를 위한 오버라이드 라벨 생성
+        node_labels = {}
+        for stn in stations:
+            f_val = step["f_scores"].get(stn, 999999)
+            if f_val < 999999 and (stn in step["open_set"] or stn in step["closed_set"]):
+                node_labels[stn] = f"f={f_val}"
+
+        cur_display_node = step.get("chosen_station") or step.get("current")
+
+        fig_a = create_graph_figure(
+            graph=graph,
+            weighted_map=weighted_map,
+            highlight_nodes=hl_path,
+            current_node=cur_display_node,
+            highlight_edges=hl_edges,
+            queue_or_stack_nodes=step.get("open_set", []),
+            start_node=a_start,
+            end_node=a_end,
+            title=f"A* 탐색 진행도 (현재 확정: {cur_display_node or '대기'}, 목적지: {a_end})",
+            layout_mode=layout_mode,
+            node_labels_override=node_labels
+        )
+        st.plotly_chart(fig_a, use_container_width=True, key=chart_key)
+
+    with col_at:
+        st.markdown(f"#### 📐 $f(n) = g(n) + {weight} \\times h(n)$ 평가표")
+        df_records = []
+        for stn in stations:
+            g_val = step["g_scores"].get(stn, 999999)
+            g_str = f"{g_val}분" if g_val < 999999 else "∞ (미도달)"
+            h_val = step["h_scores"].get(stn, 0.0)
+            h_str = f"{h_val}분"
+            f_val = step["f_scores"].get(stn, 999999)
+            f_str = f"{f_val}분" if f_val < 999999 else "∞"
+            prev_val = step["previous"].get(stn) or "-"
+
+            if stn in step["closed_set"]:
+                status = "🟢 확정(Closed)"
+            elif stn in step["open_set"]:
+                status = "🟡 열린목록(Open - 대기)"
+            else:
+                status = "⚪ 미발견"
+
+            df_records.append({
+                "지하철역": stn,
+                "g(n) 실제경과": g_str,
+                "h(n) 예상잔여": h_str,
+                "f(n) 총예상비용": f_str,
+                "직전 경유역": prev_val,
+                "상태": status
+            })
+
+        df = pd.DataFrame(df_records)
+        st.dataframe(df, hide_index=True, use_container_width=True, key=df_key)
+
+        open_candidates = step.get("open_set", [])
+        if open_candidates and not is_last:
+            best_candidate = min(open_candidates, key=lambda s: (step["f_scores"].get(s, 999999), step["h_scores"].get(s, 0.0)))
+            st.info(f"👉 **다음 선택 대상:** 열린 목록 중 $f(n)$이 최소인 **`{best_candidate}`** (f = {step['f_scores'][best_candidate]}분)")
+
+        if is_last and a_final_path:
+            st.success(f"🎯 **최종 최단 경로:** {' ➔ '.join(a_final_path)} (총 **{a_total_time}분** 소요, 방문 확정: **{len(step['closed_set'])}개 역**)")
+            st.markdown("""
+            **💡 A*가 다익스트라보다 효율적인 이유:**
+            - 다익스트라는 목표의 위치를 모른 채 모든 방향으로 퍼져나가지만,
+            - A*는 **목표역까지의 직선 예상거리($h(n)$)**를 고려해 **목표 방향의 역을 먼저 탐색**하므로 불필요한 역 방문을 최소화합니다.
+            """)
+
+
 # ------------------------------------------------------------------------------
 # 8. 메인 대시보드 레이아웃
 # ------------------------------------------------------------------------------
 def main():
     st.markdown('<div class="main-title">🚇 지하철 노선망 탐색 알고리즘 시각화</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-title">DFS(깊이 우선), BFS(너비 우선), 다익스트라(최단 경로)의 작동 원리를 인터랙티브하게 체험하세요.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-title">DFS(깊이 우선), BFS(너비 우선), 다익스트라(최단 경로), A*(휴리스틱 최단 경로)의 작동 원리를 인터랙티브하게 체험하세요.</div>', unsafe_allow_html=True)
 
     # --------------------------------------------------------------------------
     # 사이드바: 파이썬 코드 입력창 & 그래프 커스터마이징
@@ -798,15 +1095,28 @@ subway_weighted_map = {
         st.warning("⚠️ 그래프에 등록된 역(노드)이 없습니다.")
         return
 
+    # 전체 레이아웃 좌표 사전 계산 (A* 휴리스틱 및 시각화 공통 활용)
+    G_base = nx.Graph()
+    for u, neighbors in weighted_map.items():
+        for item in neighbors:
+            if isinstance(item, (tuple, list)):
+                v, w = item[0], item[1]
+            else:
+                v, w = item, 10
+            G_base.add_edge(u, v, weight=w)
+    current_pos = compute_graph_layout(G_base, selected_layout_mode)
+
     # --------------------------------------------------------------------------
-    # 5대 탭 메뉴 구성
+    # 7대 탭 메뉴 구성
     # --------------------------------------------------------------------------
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "🔍 [실습 1] DFS vs BFS 단계별 탐색",
         "⚡ [실습 2] 다익스트라 최단 경로",
-        "⚖️ [비교] DFS vs BFS 동시 비교",
+        "⭐ [실습 3] A* 휴리스틱 최단 경로",
+        "⚖️ [비교 1] DFS vs BFS 동시 비교",
+        "🚀 [비교 2] 다익스트라 vs A* 효율 비교",
         "🚧 [시나리오] 공사·지연 우회 시뮬레이터",
-        "📖 [학습] search.py 코드 및 원리"
+        "📖 [학습] 알고리즘 원리 및 search.py 코드"
     ])
 
     # ==========================================================================
@@ -1023,13 +1333,158 @@ subway_weighted_map = {
                 )
 
     # ==========================================================================
-    # TAB 3: DFS vs BFS 동시 비교
+    # TAB 3: A* 최단 경로 시뮬레이터 (휴리스틱 & 가중치 & 단계별 애니메이션)
     # ==========================================================================
     with tab3:
+        st.subheader("⭐ A* (A-star) 휴리스틱 최단 경로 시뮬레이션")
+        st.caption("목적지까지의 예상 직선거리(휴리스틱 $h$)를 나침반 삼아 목적지 방향으로 똑똑하게 전진하는 A* 알고리즘을 체험하세요.")
+
+        c_a1, c_a2, c_a3, c_a4 = st.columns([2.5, 2.5, 3.2, 2.8])
+        with c_a1:
+            a_start = st.selectbox("출발역", stations, index=0, key="t3_start")
+        with c_a2:
+            default_a_end = 5 if len(stations) > 5 else len(stations) - 1
+            a_end = st.selectbox("도착역", stations, index=default_a_end, key="t3_end")
+        with c_a3:
+            a_heuristic_choice = st.selectbox(
+                "📐 휴리스틱 $h(n)$ 함수",
+                [
+                    "유클리드 직선거리 (Euclidean) - 추천",
+                    "맨해튼 격자거리 (Manhattan)",
+                    "다익스트라 모드 ($h=0$ 설정)"
+                ],
+                index=0,
+                key="t3_heur"
+            )
+            heur_mode_map = {
+                "유클리드 직선거리 (Euclidean) - 추천": "euclidean",
+                "맨해튼 격자거리 (Manhattan)": "manhattan",
+                "다익스트라 모드 ($h=0$ 설정)": "zero"
+            }
+            selected_heur_mode = heur_mode_map[a_heuristic_choice]
+        with c_a4:
+            a_weight = st.slider(
+                "⚖️ 휴리스틱 가중치 $w$",
+                min_value=0.0,
+                max_value=2.0,
+                value=1.0,
+                step=0.1,
+                help="w=1.0: 표준 A* (최단 경로 보장) | w=0: 다익스트라와 동일 | w>1: 탐욕적 가중 A*",
+                key="t3_weight"
+            )
+
+        a_steps, a_final_path, a_total_time, a_scale = trace_astar(
+            weighted_map, a_start, a_end, current_pos, selected_heur_mode, a_weight
+        )
+        a_total_steps = len(a_steps)
+
+        # 세션 상태 초기화
+        a_state_key = f"step_idx_t3_{a_start}_{a_end}_{selected_heur_mode}_{a_weight}"
+        if a_state_key not in st.session_state:
+            st.session_state[a_state_key] = a_total_steps - 1
+
+        st.markdown("##### 🎬 A* 탐색 애니메이션 컨트롤러")
+        ca_btn1, ca_btn2, ca_btn3, ca_btn4, ca_speed = st.columns([1.5, 1.2, 1.2, 1.3, 3.5])
+
+        with ca_btn1:
+            a_play_clicked = st.button("▶️ 자동 재생", key="t3_play", use_container_width=True, type="primary")
+        with ca_btn2:
+            if st.button("⏮️ 이전", key="t3_prev", use_container_width=True):
+                st.session_state[a_state_key] = max(0, st.session_state[a_state_key] - 1)
+        with ca_btn3:
+            if st.button("⏭️ 다음", key="t3_next", use_container_width=True):
+                st.session_state[a_state_key] = min(a_total_steps - 1, st.session_state[a_state_key] + 1)
+        with ca_btn4:
+            if st.button("🔄 처음으로", key="t3_reset", use_container_width=True):
+                st.session_state[a_state_key] = 0
+        with ca_speed:
+            a_anim_speed = st.select_slider(
+                "⏱️ 재생 속도",
+                options=[0.2, 0.4, 0.7, 1.0, 1.5, 2.0],
+                value=0.7,
+                format_func=lambda s: f"{s}초/단계",
+                key="t3_speed"
+            )
+
+        a_slider_val = st.slider(
+            "직접 단계 이동 (A* Step Slider)",
+            0, a_total_steps - 1,
+            value=st.session_state[a_state_key],
+            key=f"slider_{a_state_key}"
+        )
+        st.session_state[a_state_key] = a_slider_val
+
+        a_display_placeholder = st.empty()
+
+        if a_play_clicked:
+            a_start_from = st.session_state[a_state_key]
+            if a_start_from >= a_total_steps - 1:
+                a_start_from = 0
+
+            a_prog_bar = st.progress(0.0)
+            a_anim_timestamp = time.time()
+            for idx in range(a_start_from, a_total_steps):
+                st.session_state[a_state_key] = idx
+                a_prog_bar.progress((idx + 1) / a_total_steps)
+                with a_display_placeholder.container():
+                    render_astar_step(
+                        step=a_steps[idx],
+                        total_steps=a_total_steps,
+                        a_start=a_start,
+                        a_end=a_end,
+                        a_final_path=a_final_path,
+                        a_total_time=a_total_time,
+                        graph=graph,
+                        weighted_map=weighted_map,
+                        stations=stations,
+                        layout_mode=selected_layout_mode,
+                        weight=a_weight,
+                        heuristic_type=selected_heur_mode,
+                        chart_key=f"t3_chart_anim_{idx}_{a_anim_timestamp}",
+                        df_key=f"t3_df_anim_{idx}_{a_anim_timestamp}"
+                    )
+                time.sleep(a_anim_speed)
+            a_prog_bar.empty()
+        else:
+            with a_display_placeholder.container():
+                render_astar_step(
+                    step=a_steps[st.session_state[a_state_key]],
+                    total_steps=a_total_steps,
+                    a_start=a_start,
+                    a_end=a_end,
+                    a_final_path=a_final_path,
+                    a_total_time=a_total_time,
+                    graph=graph,
+                    weighted_map=weighted_map,
+                    stations=stations,
+                    layout_mode=selected_layout_mode,
+                    weight=a_weight,
+                    heuristic_type=selected_heur_mode,
+                    chart_key=f"t3_chart_static_{st.session_state[a_state_key]}",
+                    df_key=f"t3_df_static_{st.session_state[a_state_key]}"
+                )
+
+        with st.expander("💡 A* 알고리즘의 핵심 수학 원리 & 휴리스틱(Heuristic) 가이드", expanded=False):
+            st.markdown("""
+            - **평가 함수 공식**: $f(n) = g(n) + w \\times h(n)$
+              - $g(n)$: 출발역에서 현재 역 $n$까지 이동하는 데 실제로 걸린 소요 시간
+              - $h(n)$: 현재 역 $n$에서 최종 도착역까지의 예상 잔여 시간 (휴리스틱 추정치)
+              - $f(n)$: 역 $n$을 거쳐 목적지까지 가는 총 예상 소요 시간
+            - **최적성 보장 조건 (Admissibility)**:
+              - $h(n) \\le h^*(n)$ (휴리스틱 추정치가 실제 최단 시간보다 절대 크지 않아야 함)
+              - 유클리드 직선거리 기반 휴리스틱은 삼각부등식에 의해 실제 철로 이동시간 이하를 보장하므로 **항상 100% 최단 경로**를 찾아냅니다.
+            - **$h(n) = 0$ 일 때**:
+              - $f(n) = g(n) + 0 = g(n)$ 이 되므로 **다익스트라 알고리즘과 수학적으로 완전히 동일**하게 동작합니다.
+            """)
+
+    # ==========================================================================
+    # TAB 4: DFS vs BFS 동시 비교
+    # ==========================================================================
+    with tab4:
         st.subheader("⚖️ DFS(깊이 우선) vs BFS(너비 우선) 나란히 비교")
         st.caption("동일한 출발역에서 두 알고리즘이 지하철망을 어떤 순서로 탐색하는지 직접 대조해보세요.")
 
-        cmp_start = st.selectbox("비교할 출발역 선택", stations, index=0, key="t3_start")
+        cmp_start = st.selectbox("비교할 출발역 선택", stations, index=0, key="t4_start")
 
         dfs_trace = trace_dfs(graph, cmp_start)[-1]
         dfs_result = dfs_trace["visited"]
@@ -1055,7 +1510,7 @@ subway_weighted_map = {
                 title=f"DFS 탐색 경로 (깊게 전진)",
                 layout_mode=selected_layout_mode
             )
-            st.plotly_chart(fig_dfs, use_container_width=True, key="t3_dfs_chart")
+            st.plotly_chart(fig_dfs, use_container_width=True, key="t4_dfs_chart")
             st.markdown("""
             **특징:**
             - 막다른 길이 나올 때까지 끝까지 파고든 후 되돌아옵니다 (Backtracking).
@@ -1076,7 +1531,7 @@ subway_weighted_map = {
                 title=f"BFS 탐색 경로 (넓게 번짐)",
                 layout_mode=selected_layout_mode
             )
-            st.plotly_chart(fig_bfs, use_container_width=True, key="t3_bfs_chart")
+            st.plotly_chart(fig_bfs, use_container_width=True, key="t4_bfs_chart")
             st.markdown("""
             **특징:**
             - 출발역에서 1정거장 거리 ➔ 2정거장 거리 순으로 동심원을 그리며 퍼져나갑니다.
@@ -1084,13 +1539,137 @@ subway_weighted_map = {
             """)
 
     # ==========================================================================
-    # TAB 4: 공사/지연 시뮬레이터 (What-if 분석)
+    # TAB 5: 다익스트라 vs A* 효율 비교 (나란히 대조)
     # ==========================================================================
-    with tab4:
+    with tab5:
+        st.subheader("🚀 다익스트라(전방위 탐색) vs A*(목표 지향형 탐색) 효율 비교")
+        st.caption("동일한 출발역과 도착역에서 다익스트라와 A*의 탐색 범위, 방문 역 수, 방향성을 나란히 비교해보세요.")
+
+        col_cp1, col_cp2, col_cp3, col_cp4 = st.columns([2.5, 2.5, 3.5, 2.5])
+        with col_cp1:
+            c2_start = st.selectbox("출발역 선택", stations, index=0, key="t5_start")
+        with col_cp2:
+            default_c2_end = 5 if len(stations) > 5 else len(stations) - 1
+            c2_end = st.selectbox("도착역 선택", stations, index=default_c2_end, key="t5_end")
+        with col_cp3:
+            c2_heur_choice = st.selectbox(
+                "A* 휴리스틱 모드",
+                ["유클리드 직선거리 (추천)", "맨해튼 거리", "0 (다익스트라 모드)"],
+                index=0,
+                key="t5_heur"
+            )
+            c2_heur_map = {
+                "유클리드 직선거리 (추천)": "euclidean",
+                "맨해튼 거리": "manhattan",
+                "0 (다익스트라 모드)": "zero"
+            }
+            c2_heur = c2_heur_map[c2_heur_choice]
+        with col_cp4:
+            c2_weight = st.slider("A* 가중치 (w)", 0.0, 2.0, 1.0, 0.1, key="t5_weight", help="w=1.0: 표준 A*, w=0: 다익스트라와 동일")
+
+        # 다익스트라 실행
+        d_trace, d_opt_path, d_opt_time = trace_dijkstra(weighted_map, c2_start, c2_end)
+        d_visited_nodes = d_trace[-1]["visited"]
+        d_visited_count = len(d_visited_nodes)
+
+        # A* 실행
+        a_trace, a_opt_path, a_opt_time, _ = trace_astar(weighted_map, c2_start, c2_end, current_pos, c2_heur, c2_weight)
+        a_visited_nodes = a_trace[-1]["closed_set"]
+        a_visited_count = len(a_visited_nodes)
+
+        # 핵심 비교 메트릭 카드
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("⚡ 다익스트라 방문 역 수", f"{d_visited_count}개 역")
+        with m2:
+            delta_val = a_visited_count - d_visited_count
+            st.metric("⭐ A* 방문 역 수", f"{a_visited_count}개 역", delta=f"{delta_val}개", delta_color="inverse")
+        with m3:
+            saved_percent = round((1 - a_visited_count / max(1, d_visited_count)) * 100, 1)
+            st.metric("🎯 탐색 노드 절감율", f"{saved_percent}%" if saved_percent > 0 else "동일", delta="A*의 탐색 집중도" if saved_percent > 0 else None)
+        with m4:
+            st.metric("⏱️ 최종 최단 시간", f"{a_opt_time}분", f"다익스트라와 동일 ({d_opt_time}분)")
+
+        # 나란히 시각화
+        col_view1, col_view2 = st.columns(2)
+
+        with col_view1:
+            st.markdown("### ⚡ 다익스트라 최단 경로")
+            st.markdown('<span class="algo-badge badge-dijkstra">탐색 방식: 전방위 동심원 확산</span>', unsafe_allow_html=True)
+            st.write(f"**방문(확정) 역:** {' ➔ '.join(d_visited_nodes)} (총 {d_visited_count}개)")
+            st.write(f"**최단 경로:** {' ➔ '.join(d_opt_path)} (**{d_opt_time}분**)")
+
+            d_hl_edges = [(d_opt_path[i], d_opt_path[i+1]) for i in range(len(d_opt_path)-1)] if d_opt_path else []
+            fig_dijk_cmp = create_graph_figure(
+                graph=graph,
+                weighted_map=weighted_map,
+                highlight_nodes=d_visited_nodes,
+                highlight_edges=d_hl_edges,
+                start_node=c2_start,
+                end_node=c2_end,
+                title=f"다익스트라: 사방으로 넓게 탐색 ({d_visited_count}개 역 방문)",
+                layout_mode=selected_layout_mode
+            )
+            st.plotly_chart(fig_dijk_cmp, use_container_width=True, key="t5_dijk_chart")
+
+        with col_view2:
+            st.markdown("### ⭐ A* 최단 경로")
+            st.markdown('<span class="algo-badge badge-astar">탐색 방식: 목적지 지향 집중 탐색</span>', unsafe_allow_html=True)
+            st.write(f"**방문(확정) 역:** {' ➔ '.join(a_visited_nodes)} (총 {a_visited_count}개)")
+            st.write(f"**최단 경로:** {' ➔ '.join(a_opt_path)} (**{a_opt_time}분**)")
+
+            a_hl_edges = [(a_opt_path[i], a_opt_path[i+1]) for i in range(len(a_opt_path)-1)] if a_opt_path else []
+            fig_astar_cmp = create_graph_figure(
+                graph=graph,
+                weighted_map=weighted_map,
+                highlight_nodes=a_visited_nodes,
+                highlight_edges=a_hl_edges,
+                start_node=c2_start,
+                end_node=c2_end,
+                title=f"A*: 목적지 방향으로 스마트하게 탐색 ({a_visited_count}개 역 방문)",
+                layout_mode=selected_layout_mode
+            )
+            st.plotly_chart(fig_astar_cmp, use_container_width=True, key="t5_astar_chart")
+
+        # 비교 종합 정리 테이블
+        st.markdown("#### 📊 다익스트라 vs A* 알고리즘 상세 비교표")
+        cmp_df = pd.DataFrame([
+            {
+                "비교 항목": "평가 함수",
+                "⚡ 다익스트라 (Dijkstra)": "g(n) (시작점부터 현재까지 실제 소요시간만 고려)",
+                "⭐ A* (A-star)": "f(n) = g(n) + h(n) (실제 소요시간 + 목적지까지 잔여 예상시간)"
+            },
+            {
+                "비교 항목": "탐색 방향성",
+                "⚡ 다익스트라 (Dijkstra)": "목표 위치를 몰라 모든 방향으로 동심원(물결)처럼 확산",
+                "⭐ A* (A-star)": "휴리스틱(나침반)을 이용해 목적지 방향 노드를 우선적으로 집중 탐색"
+            },
+            {
+                "비교 항목": "방문 노드 수",
+                "⚡ 다익스트라 (Dijkstra)": "상대적으로 많음 (반대 방향 경로도 함께 검토)",
+                "⭐ A* (A-star)": "최소화 (목표와 반대 방향인 노드는 후순위로 밀림)"
+            },
+            {
+                "비교 항목": "최단 경로 보장성",
+                "⚡ 다익스트라 (Dijkstra)": "가중치가 양수일 때 항상 100% 최단 경로 보장",
+                "⭐ A* (A-star)": "h(n)이 실제보다 과대평가되지 않으면(Admissible) 100% 최단 경로 보장"
+            },
+            {
+                "비교 항목": "주요 활용 분야",
+                "⚡ 다익스트라 (Dijkstra)": "네트워크 라우팅(OSPF), 1대 전체 최단거리 계산",
+                "⭐ A* (A-star)": "자동차 내비게이션(Tmap, 카카오맵), 게임 캐릭터 길찾기, 로봇 공학"
+            }
+        ])
+        st.dataframe(cmp_df, hide_index=True, use_container_width=True, key="t5_summary_df")
+
+    # ==========================================================================
+    # TAB 6: 공사/지연 시뮬레이터 (What-if 분석)
+    # ==========================================================================
+    with tab6:
         st.subheader("🚧 실시간 지하철 공사 및 지연 우회 시나리오")
         st.caption("수업 활동지 과제: '동대문역 공사로 시간이 대폭 늘어나면 최단 경로는 어떻게 바뀔까?'")
 
-        st.info("💡 아래 슬라이더로 특정 구간의 소요 시간을 늘리거나 줄여보세요. 다익스트라 최단 경로가 실시간으로 다른 노선으로 우회합니다.")
+        st.info("💡 아래 슬라이더로 특정 구간의 소요 시간을 늘리거나 줄여보세요. 최단 경로가 실시간으로 다른 노선으로 우회합니다.")
 
         all_edges = []
         for u, neighbors in weighted_map.items():
@@ -1143,36 +1722,40 @@ subway_weighted_map = {
                 title=f"우회 시뮬레이션 최단 경로 ({sc_start} ➔ {sc_end})",
                 layout_mode=selected_layout_mode
             )
-            st.plotly_chart(fig_sc, use_container_width=True, key="t4_scenario_chart")
+            st.plotly_chart(fig_sc, use_container_width=True, key="t6_scenario_chart")
 
     # ==========================================================================
-    # TAB 5: 코드 및 개념 학습장
+    # TAB 7: 코드 및 개념 학습장
     # ==========================================================================
-    with tab5:
-        st.subheader("📖 search.py 소스 코드 및 핵심 알고리즘 원리")
+    with tab7:
+        st.subheader("📖 그래프 탐색 4대 알고리즘 핵심 원리 & search.py 코드")
         
         col_cd1, col_cd2 = st.columns(2)
 
         with col_cd1:
-            st.markdown("#### 1. 자료구조 비교")
-            st.markdown("""
-            | 비교 항목 | 스택 (Stack) | 큐 (Queue) |
-            | :--- | :--- | :--- |
-            | **규칙** | LIFO (Last In First Out) | FIFO (First In First Out) |
-            | **파이썬 코드** | `stack.pop()` (맨 뒤 추출) | `queue.pop(0)` (맨 앞 추출) |
-            | **탐색 알고리즘** | **DFS** (깊이 우선) | **BFS** (너비 우선) |
-            | **비유** | 프링글스 감자칩 통, 책 쌓기 | 은행 번호표 창구, 줄서기 |
+            st.markdown("#### 1. 4대 탐색 알고리즘 한눈에 비교")
+            st.markdown(r"""
+            | 알고리즘 | 사용 자료구조 | 가중치(시간) 고려 | 방향성(목적지) | 최단 경로 보장 | 주 용도 |
+            | :--- | :--- | :--- | :--- | :--- | :--- |
+            | **DFS** | 스택 (LIFO) | ❌ 무가중치 | ❌ 맹목적 | ❌ 비보장 | 미로 탈출, 연결성 확인 |
+            | **BFS** | 큐 (FIFO) | ❌ 무가중치 | ❌ 전방위 | ⭕ 최소 환승역 보장 | 최소 환승 경로, SNS 친구 탐색 |
+            | **다익스트라** | 우선순위 큐 ($g(n)$) | ⭕ 고려 (시간/거리) | ❌ 동심원 확산 | ⭕ 최단 시간 보장 | 네트워크 라우팅, 전체 경로표 |
+            | **A\*** | 우선순위 큐 ($f=g+h$) | ⭕ 고려 (시간/거리) | ⭕ **목표 지향형** | ⭕ 최단 시간 보장 | **내비게이션, 게임 AI 길찾기** |
             """)
 
-            st.markdown("#### 2. 다익스트라 3단계 메커니즘")
-            st.markdown("""
-            1. **초기화**: 시작역 소요 시간 0분, 나머지 모든 역 무한대(999999분) 설정
-            2. **선택**: 미방문 역 중 현재 소요 시간이 가장 작은 역 선택 및 확정
-            3. **갱신**: `선택된 역 시간 + 이동 시간 < 기존 이웃 역 시간`이면 더 빠른 시간으로 업데이트하고 `previous` 기록
+            st.markdown("#### 2. 다익스트라 vs A* 핵심 비교")
+            st.markdown(r"""
+            - **다익스트라의 한계**: 목적지가 어디에 있는지 전혀 고려하지 않고, 시작점으로부터 소요 시간이 짧은 역부터 사방으로 무차별 탐색합니다.
+            - **A*의 혁신**: $f(n) = g(n) + h(n)$
+              - $g(n)$: 현재까지 실제로 온 거리(시간)
+              - $h(n)$: 목적지까지 남은 예상 직선거리(시간)
+              - **효과**: 목적지와 반대 방향인 역은 $h(n)$ 값이 커져서 탐색 우선순위가 뒤로 밀리고, **목적지 방향 역을 우선 탐색**하여 탐색 속도가 획기적으로 향상됩니다.
+            - **휴리스틱 적합성 (Admissibility)**:
+              - 직선거리는 절대 실제 철로 소요 시간보다 길 수 없으므로($h(n) \le h^*(n)$), A*는 항상 100% 최단 경로를 보장합니다.
             """)
 
         with col_cd2:
-            st.markdown("#### 💻 search.py 원본 코드")
+            st.markdown("#### 💻 search.py 원본 코드 (DFS, BFS, 다익스트라, A*)")
             try:
                 with open("search.py", "r", encoding="utf-8") as f:
                     code_content = f.read()
