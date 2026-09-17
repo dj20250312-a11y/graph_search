@@ -872,6 +872,7 @@ def create_graph_figure(
     for node in G.nodes():
         x, y = pos[node]
         node_x.append(x)
+        node_y.append(y)
         lbl = f"<b>{node}</b>"
         if node_labels_override and node in node_labels_override:
             lbl += f"<br><span style='font-size:10px;color:#475569;'>{node_labels_override[node]}</span>"
